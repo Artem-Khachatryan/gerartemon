@@ -1,0 +1,139 @@
+name: "Auto-docs: MR → Claude Code → Linear"
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  generate-linear-doc:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Collect PR info
+        id: pr_info
+        run: |
+          echo "pr_title=${{ github.event.pull_request.title }}" >> "$GITHUB_OUTPUT"
+
+          PR_BODY=$(cat <<'BODY_EOF'
+          ${{ github.event.pull_request.body }}
+          BODY_EOF
+          )
+
+          DIFF=$(git diff --stat origin/${{ github.event.pull_request.base.ref }}...HEAD 2>/dev/null || echo "No diff available")
+
+          CHANGED_FILES=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD 2>/dev/null || echo "No files")
+
+          {
+            echo "diff<<DIFF_EOF"
+            echo "$DIFF"
+            echo "DIFF_EOF"
+            echo "changed_files<<FILES_EOF"
+            echo "$CHANGED_FILES"
+            echo "FILES_EOF"
+            echo "pr_body<<BODY_DELIM"
+            echo "$PR_BODY"
+            echo "BODY_DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate documentation with Claude Code
+        id: claude_doc
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          DOC_CONTENT=$(claude -p "
+          Ты — технический писатель проекта Nexpanse.
+          Сгенерируй документацию на основе Pull Request.
+
+          === PR Info ===
+          Title: ${{ steps.pr_info.outputs.pr_title }}
+          Description: ${{ steps.pr_info.outputs.pr_body }}
+
+          === Changed Files ===
+          ${{ steps.pr_info.outputs.changed_files }}
+
+          === Diff Stats ===
+          ${{ steps.pr_info.outputs.diff }}
+
+          === Инструкции ===
+          Формат ответа — только Markdown, без пояснений.
+          Структура:
+          1. Заголовок: название PR
+          2. Дата: $(date +%Y-%m-%d)
+          3. Описание изменений (2-4 предложения)
+          4. Список затронутых файлов с пояснением что изменилось
+          5. Категория: Разработка или Тестирование (определи по содержимому)
+          6. Возможное влияние на другие компоненты
+
+          Пиши на русском языке.
+          " --max-turns 3 2>/dev/null)
+
+          {
+            echo "doc<<DOC_EOF"
+            echo "$DOC_CONTENT"
+            echo "DOC_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send document to Linear
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: |
+          PR_TITLE="${{ steps.pr_info.outputs.pr_title }}"
+          PR_NUM="${{ github.event.pull_request.number }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          DOC_CONTENT='${{ steps.claude_doc.outputs.doc }}'
+
+          # Добавляем ссылку на PR в начало документа
+          FULL_CONTENT="🔗 **Pull Request:** [#${PR_NUM} — ${PR_TITLE}](${PR_URL})
+
+          ---
+
+          ${DOC_CONTENT}"
+
+          # Экранируем для JSON
+          ESCAPED_CONTENT=$(echo "$FULL_CONTENT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+
+          # Nexpanse project ID
+          PROJECT_ID="8ef56b7c-b1c2-4294-a1fe-134615eb4ed5"
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: $LINEAR_API_KEY" \
+            --data "{
+              \"query\": \"mutation(\$title: String!, \$content: String, \$projectId: String!) { documentCreate(input: { title: \$title, content: \$content, projectId: \$projectId }) { success document { id url } } }\",
+              \"variables\": {
+                \"title\": \"MR #${PR_NUM}: ${PR_TITLE}\",
+                \"content\": ${ESCAPED_CONTENT},
+                \"projectId\": \"${PROJECT_ID}\"
+              }
+            }" \
+            https://api.linear.app/graphql)
+
+          echo "Linear API response: $RESPONSE"
+
+          # Проверяем успех
+          SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('documentCreate',{}).get('success','false'))" 2>/dev/null || echo "false")
+
+          if [ "$SUCCESS" = "True" ] || [ "$SUCCESS" = "true" ]; then
+            DOC_URL=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['documentCreate']['document']['url'])" 2>/dev/null)
+            echo "✅ Document created in Linear: $DOC_URL"
+          else
+            echo "❌ Failed to create document in Linear"
+            echo "$RESPONSE"
+            exit 1
+          fi
