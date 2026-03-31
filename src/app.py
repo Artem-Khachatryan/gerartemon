@@ -22,5 +22,10 @@ def get_app_info():
     }
 
 
+def get_status():
+    """Возвращает текущий статус приложения."""
+    return {"status": "running", "version": get_version()}
+
+
 if __name__ == "__main__":
     print(hello())
