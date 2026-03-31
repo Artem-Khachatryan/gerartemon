@@ -13,5 +13,14 @@ def get_version():
     return "0.1.0"
 
 
+def get_app_info():
+    """Возвращает основную информацию о приложении."""
+    return {
+        "name": "Nexpanse",
+        "version": get_version(),
+        "greeting": hello(),
+    }
+
+
 if __name__ == "__main__":
     print(hello())
